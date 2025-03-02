@@ -9,6 +9,7 @@ from mutagen import File
 from mutagen.mp3 import MP3
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC
+import musicbrainzngs
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(message)s',
@@ -44,6 +45,9 @@ class MusicFileHandler(FileSystemEventHandler):
     def __init__(self):
         super().__init__()
         self.directory_state = {}  # Track state of each directory
+        # Set up MusicBrainz
+        musicbrainzngs.set_useragent("MusicSort", "1.0", "https://github.com/tonycollett/musicsort")
+        musicbrainzngs.set_rate_limit(True)  # Be nice to the MusicBrainz server
         self.last_file_time = {}  # Track last file addition time per directory
 
     def is_file_locked(self, filepath, timeout=60, check_interval=1):
@@ -221,6 +225,62 @@ class MusicFileHandler(FileSystemEventHandler):
         except Exception as e:
             print(f"Error adding cover art: {e}")
 
+    def lookup_musicbrainz_metadata(self, filepath):
+        """
+        Attempt to find metadata using MusicBrainz acoustic fingerprint.
+        Returns a dictionary of tags if successful, None otherwise.
+        """
+        try:
+            # First try to get any existing metadata that might help with search
+            audio = File(filepath, easy=True)
+            
+            # Get audio duration in seconds for better matching
+            duration = int(audio.info.length)
+            
+            search_params = {}
+            
+            # Try to get any existing metadata that might help
+            if audio and hasattr(audio, 'tags'):
+                title = audio.get('title', [''])[0]
+                artist = audio.get('artist', [''])[0]
+                
+                if title:
+                    search_params['recording'] = title
+                if artist:
+                    search_params['artist'] = artist
+
+            # Search MusicBrainz
+            if search_params:
+                result = musicbrainzngs.search_recordings(**search_params, limit=5)
+                closest_match = None
+                
+                if result.get('recording-list'):
+                    # Find the recording with the closest duration match
+                    for recording in result['recording-list']:
+                        if 'length' in recording:
+                            mb_duration = int(recording['length']) / 1000  # Convert ms to seconds
+                            if abs(mb_duration - duration) <= 3:  # Within 3 seconds tolerance
+                                closest_match = recording
+                                break
+
+                    # If no duration match found within tolerance, take first result
+                    if not closest_match and result['recording-list']:
+                        closest_match = result['recording-list'][0]
+                    
+                    if closest_match:
+                        # Return standardized metadata
+                        return {
+                            'title': closest_match.get('title'),
+                            'artist': closest_match['artist-credit'][0]['name'] if closest_match.get('artist-credit') else None,
+                            'album': closest_match['release-list'][0]['title'] if closest_match.get('release-list') else None,
+                            'date': closest_match['release-list'][0]['date'] if closest_match.get('release-list') else None,
+                            'tracknumber': closest_match['release-list'][0].get('medium-list', [{}])[0].get('track-list', [{}])[0].get('number') if closest_match.get('release-list') else None
+                        }
+            
+        except Exception as e:
+            print(f"Error looking up metadata in MusicBrainz: {e}")
+        return None
+
     def move_to_unknown(self, filepath):
         """Move a file to the unknown folder structure"""
         source_dir = os.path.dirname(filepath)
@@ -284,9 +344,32 @@ class MusicFileHandler(FileSystemEventHandler):
             track_num = get_metadata_field(audio, 'tracknumber')
             year = get_metadata_field(audio, 'date')
 
-            # Validate all required fields are present
+            # If missing required fields, try MusicBrainz lookup
             if not all([artist, album, title, track_num, year]):
-                print(f"Missing required tags in {filepath}. Moving to unknown folder.")
+                print(f"Missing required tags in {filepath}. Attempting MusicBrainz lookup...")
+                mb_metadata = self.lookup_musicbrainz_metadata(filepath)
+                
+                if mb_metadata:
+                    # Update missing fields with MusicBrainz data
+                    if not artist and mb_metadata.get('artist'):
+                        audio['artist'] = mb_metadata['artist']
+                        artist = mb_metadata['artist']
+                    if not album and mb_metadata.get('album'):
+                        audio['album'] = mb_metadata['album']
+                        album = mb_metadata['album']
+                    if not title and mb_metadata.get('title'):
+                        audio['title'] = mb_metadata['title']
+                        title = mb_metadata['title']
+                    if not track_num and mb_metadata.get('tracknumber'):
+                        audio['tracknumber'] = str(mb_metadata['tracknumber'])
+                        track_num = int(mb_metadata['tracknumber'])
+                    if not year and mb_metadata.get('date'):
+                        audio['date'] = mb_metadata['date']
+                        year = mb_metadata['date']
+                    audio.save()
+
+            if not all([artist, album, title, track_num, year]):
+                print(f"Still missing required tags after MusicBrainz lookup. Moving to unknown folder.")
                 return False
 
             # Extract year from date (e.g. "2023" from "2023-01-01")
