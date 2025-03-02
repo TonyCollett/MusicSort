@@ -3,6 +3,7 @@ import shutil
 import time
 import logging
 from watchdog.observers import Observer
+from PIL import Image
 from watchdog.events import FileSystemEventHandler
 from mutagen import File
 
@@ -11,6 +12,32 @@ logging.basicConfig(level=logging.INFO,
                     datefmt='%Y-%m-%d %H:%M:%S')
 
 class MusicFileHandler(FileSystemEventHandler):
+    def find_cover_art(self, directory):
+        """Find and read cover art from jpg/png files in directory"""
+        for file in os.listdir(directory):
+            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                image_path = os.path.join(directory, file)
+                try:
+                    # Open and verify the image
+                    with Image.open(image_path) as img:
+                        # Convert to bytes
+                        img_format = img.format
+                        if img_format not in ('JPEG', 'PNG'):
+                            continue
+                        
+                        # Convert to bytes
+                        if img_format == 'PNG':
+                            mime_type = 'image/png'
+                        else:
+                            mime_type = 'image/jpeg'
+                            
+                        with open(image_path, 'rb') as f:
+                            return f.read(), mime_type
+                except Exception as e:
+                    print(f"Error reading cover art {image_path}: {e}")
+        
+        return None, None
+
     def __init__(self):
         super().__init__()
         self.directory_state = {}  # Track state of each directory
@@ -77,12 +104,20 @@ class MusicFileHandler(FileSystemEventHandler):
                 locked_files.append(filepath)
         
         if not locked_files:
-            # All files are unlocked, process the directory
-            self.process_directory(directory)
+            # All files are unlocked, find cover art before processing
+            cover_data = None
+            mime_type = None
+            try:
+                cover_data, mime_type = self.find_cover_art(directory)
+            except Exception as e:
+                logging.error(f"Error finding cover art: {e}")
+
+            # Process directory with cover art if found
+            self.process_directory(directory, cover_data, mime_type)
         else:
             logging.info(f"Directory {directory} has {len(locked_files)} locked files, waiting...")
 
-    def process_directory(self, directory):
+    def process_directory(self, directory, cover_data=None, mime_type=None):
         """Process all files in a directory"""
         state = self.directory_state[directory]
         pending_files = state['pending_files'].copy()
@@ -93,7 +128,19 @@ class MusicFileHandler(FileSystemEventHandler):
                 state['pending_files'].remove(filepath)
                 continue
 
-            if self.process_music_file(filepath):
+            # Apply cover art before moving the file
+            if cover_data and mime_type:
+                try:
+                    audio = File(filepath)
+                    if audio is not None and (hasattr(audio, 'add_picture') or hasattr(audio, 'tags')):
+                        self.add_cover_art(audio, cover_data, mime_type)
+                        audio.save()
+                        print(f"Successfully applied cover art to {filepath}")
+                except Exception as e:
+                    print(f"Error adding cover art to {filepath}: {e}")
+
+            success = self.process_music_file(filepath)
+            if success:
                 state['pending_files'].remove(filepath)
                 state['processed_files'].add(filepath)
             else:
@@ -101,12 +148,67 @@ class MusicFileHandler(FileSystemEventHandler):
                 state['failed_files'].add(filepath)
                 self.move_to_unknown(filepath)
 
-        # If no more pending files, handle cleanup
-        if not state['pending_files']:
+        # Handle cleanup only after all files are processed and cover art is applied
+        if not state['pending_files'] and directory in self.directory_state:
             self.handle_remaining_files(directory)
-            # Clean up tracking
             del self.directory_state[directory]
             del self.last_file_time[directory]
+
+    def has_cover_art(self, audio):
+        """Check if audio file already has cover art"""
+        try:
+            # FLAC files
+            if hasattr(audio, 'pictures'):
+                for pic in audio.pictures:
+                    if pic.type == 3:  # Cover (front)
+                        return True
+                return False
+                
+            # MP3 files
+            elif hasattr(audio, 'tags') and audio.tags:
+                # Check for APIC frame in ID3 tags
+                if hasattr(audio.tags, 'getall'):
+                    return bool(audio.tags.getall('APIC'))
+                    
+                # Alternative check for other tag formats
+                for tag in audio.tags.values():
+                    if 'APIC' in str(tag) or 'PICTURE' in str(tag):
+                        return True
+                        
+            return False
+            
+        except Exception as e:
+            print(f"Error checking cover art in {audio.filename}: {e}")
+            return False
+
+    def add_cover_art(self, audio, image_data, mime_type):
+        """Add cover art to audio file based on format"""
+        try:
+            # Skip if cover art already exists
+            if self.has_cover_art(audio):
+                print(f"Cover art already exists in {audio.filename}")
+                return
+
+            # FLAC files
+            if hasattr(audio, 'add_picture'):
+                from mutagen.flac import Picture
+                pic = Picture()
+                pic.data = image_data
+                pic.type = 3  # Cover (front)
+                pic.mime = mime_type
+                audio.add_picture(pic)
+                print(f"Added cover art to FLAC file: {audio.filename}")
+
+            # MP3 files
+            elif hasattr(audio, 'tags') and audio.tags:
+                if hasattr(audio.tags, 'add'):
+                    from mutagen.id3 import APIC
+                    audio.tags.add(APIC(encoding=3, mime=mime_type,
+                                      type=3, desc='Cover', data=image_data))
+                    print(f"Added cover art to MP3 file: {audio.filename}")
+
+        except Exception as e:
+            print(f"Error adding cover art: {e}")
 
     def move_to_unknown(self, filepath):
         """Move a file to the unknown folder structure"""
@@ -214,19 +316,57 @@ class MusicFileHandler(FileSystemEventHandler):
         # Remove invalid characters for file names
         return "".join(c for c in filename if c.isalnum() or c in ['.', '_', ' ']).rstrip()
     
+    def remove_empty_dirs(self, path, stop_at=None):
+        """Recursively remove empty directories, return True if directory was removed"""
+        if not os.path.isdir(path):
+            return False
+        
+        # Remove empty subdirectories
+        for subdir in os.listdir(path):
+            full_path = os.path.join(path, subdir)
+            if os.path.isdir(full_path) and not os.path.islink(full_path):
+                self.remove_empty_dirs(full_path, stop_at)
+                
+        # Don't remove the stop_at directory
+        if stop_at and os.path.samefile(path, stop_at):
+            return False
+            
+        # Try to remove if empty
+        try:
+            os.rmdir(path)
+            print(f"Removed empty directory: {path}")
+            
+            # Try to remove parent if it's empty (unless it's the stop_at directory)
+            parent = os.path.dirname(path)
+            if parent and (not stop_at or not os.path.samefile(parent, stop_at)):
+                self.remove_empty_dirs(parent, stop_at)
+                
+            return True
+        except OSError:  # Directory not empty
+            return False
+
+    
     def handle_remaining_files(self, processed_dir):
-        """Move any non-music files to Unknown folder structure and delete the processed directory"""
+        """Move non-music/non-cover files to Unknown folder and clean up empty directories"""
         music_extensions = ('.mp3', '.flac', '.ogg', '.m4a')
+        image_extensions = ('.jpg', '.jpeg', '.png')
+        # Handle remaining files: delete cover art, move others to unknown
+        
         for root, dirs, files in os.walk(processed_dir):
             if files:  # If there are any files in this directory
                 for file in files:
                     # Skip music files as they should have been processed already
                     if file.endswith(music_extensions):
                         continue
+                    
+                    # Delete cover art files after processing
+                    if file.endswith(image_extensions):
+                        os.remove(os.path.join(root, file))
+                        print(f"Removed cover art file: {file}")
+                        continue
+
                     source_file = os.path.join(root, file)
-                    # Create relative path structure starting from watch folder
-                    rel_path = os.path.relpath(root, processed_dir)
-                    # Create destination path in Unknown folder with same structure
+                    rel_path = os.path.relpath(os.path.dirname(source_file), 'watch')
                     dest_dir = os.path.join('unknown', rel_path)
                     os.makedirs(dest_dir, exist_ok=True)
                     
@@ -234,10 +374,11 @@ class MusicFileHandler(FileSystemEventHandler):
                     shutil.move(source_file, os.path.join(dest_dir, file))
                     print(f"Moved unprocessed file to Unknown folder: {file}")
         
-        # After moving all files, remove the processed directory
+        # After moving files, clean up this processed directory if empty
         try:
-            shutil.rmtree(processed_dir)
-            print(f"Removed processed directory: {processed_dir}")
+            # This will remove the directory and its parent directories if they're empty
+            watch_path = os.path.abspath('watch')
+            self.remove_empty_dirs(processed_dir, stop_at=watch_path)
         except Exception as e:
             print(f"Error removing directory {processed_dir}: {e}")
 

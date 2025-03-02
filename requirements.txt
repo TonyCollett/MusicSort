@@ -1,0 +1,3 @@
+watchdog>=3.0.0
+mutagen>=1.46.0
+Pillow>=10.0.0  # Python Imaging Library for image handling
