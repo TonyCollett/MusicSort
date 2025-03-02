@@ -6,6 +6,9 @@ from watchdog.observers import Observer
 from PIL import Image
 from watchdog.events import FileSystemEventHandler
 from mutagen import File
+from mutagen.mp3 import MP3
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import APIC
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(message)s',
@@ -131,7 +134,16 @@ class MusicFileHandler(FileSystemEventHandler):
             # Apply cover art before moving the file
             if cover_data and mime_type:
                 try:
-                    audio = File(filepath)
+                    # Handle MP3 files differently for cover art
+                    if filepath.lower().endswith('.mp3'):
+                        audio = MP3(filepath)
+                        # Ensure ID3 tags exist
+                        if not audio.tags:
+                            audio.add_tags()
+                    else:
+                        audio = File(filepath)
+                    
+                    # Process cover art
                     if audio is not None and (hasattr(audio, 'add_picture') or hasattr(audio, 'tags')):
                         self.add_cover_art(audio, cover_data, mime_type)
                         audio.save()
@@ -202,7 +214,6 @@ class MusicFileHandler(FileSystemEventHandler):
             # MP3 files
             elif hasattr(audio, 'tags') and audio.tags:
                 if hasattr(audio.tags, 'add'):
-                    from mutagen.id3 import APIC
                     audio.tags.add(APIC(encoding=3, mime=mime_type,
                                       type=3, desc='Cover', data=image_data))
                     print(f"Added cover art to MP3 file: {audio.filename}")
@@ -249,12 +260,22 @@ class MusicFileHandler(FileSystemEventHandler):
                 return None
 
         try:
-            audio = File(filepath)
-            if audio is None:
-                print(f"Could not read tags from {filepath}. Skipping.")
-                return False
-            
-            print(f"Audio tags: {audio.tags}")  # Debugging
+            # Use EasyID3 for MP3 files
+            if filepath.lower().endswith('.mp3'):
+                try:
+                    audio = EasyID3(filepath)
+                except:
+                    # If no ID3 tags exist, create them
+                    mp3 = MP3(filepath)
+                    mp3.add_tags()
+                    mp3.save()
+                    audio = EasyID3(filepath)
+            else:
+                # For non-MP3 files, use regular File
+                audio = File(filepath)
+                if audio is None:
+                    print(f"Could not read tags from {filepath}. Skipping.")
+                    return False
 
             # Extract required metadata
             artist = get_metadata_field(audio, 'artist')
@@ -293,8 +314,15 @@ class MusicFileHandler(FileSystemEventHandler):
                     with open(lrc_filepath, 'r', encoding='utf-8') as lrc_file:
                         lyrics = lrc_file.read()
                     
-                    audio['lyrics'] = lyrics
-                    audio.save()
+                    if filepath.lower().endswith('.mp3'):
+                        # For MP3 files, need to use regular MP3 object for lyrics
+                        mp3 = MP3(filepath)
+                        from mutagen.id3 import USLT
+                        mp3.tags.add(USLT(encoding=3, lang='eng', desc='', text=lyrics))
+                        mp3.save()
+                    else:
+                        audio['lyrics'] = lyrics
+                        audio.save()
                     print(f"Added lyrics from {lrc_filepath} to {filepath}")
                     # Delete the source lyrics file after successful embedding
                     os.remove(lrc_filepath)
